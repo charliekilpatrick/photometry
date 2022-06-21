@@ -72,6 +72,9 @@ if not coord:
     print('Exiting...')
     sys.exit()
 
+# This is to prevent argparse from choking if dec was not degrees as float
+sys.argv[2] = str(coord.ra.degree) ; sys.argv[3] = str(coord.dec.degree)
+
 parser = add_options()
 opt = parser.parse_args()
 
