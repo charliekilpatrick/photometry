@@ -55,20 +55,25 @@ def add_options(parser=None, usage=None):
 
     return(parser)
 
-parser = add_options()
-opt = parser.parse_args()
+if len(sys.argv)<4:
+    print('Usage: aperture.py filename ra dec [options]')
+    sys.exit()
 
-filename = opt.filename
+filename = sys.argv[1]
 if not os.path.exists(filename):
     print('ERROR: file {0} does not exist!'.format(filename))
     print('Exiting...')
     sys.exit()
 
-coord = parse_coord(opt.ra, opt.dec)
+coord = parse_coord(sys.argv[2], sys.argv[3])
 if not coord:
-    print('ERROR: could not parse ra={0}, dec={0} into a coordinate')
+    print('ERROR: could not parse '+\
+        f'ra={sys.argv[2]}, dec={sys.argv[3]} into a coordinate')
     print('Exiting...')
     sys.exit()
+
+parser = add_options()
+opt = parser.parse_args()
 
 def get_photometry(file, coord, radius=3, significant_figures=4):
     hdu = fits.open(file)
