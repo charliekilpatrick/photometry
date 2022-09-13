@@ -52,6 +52,8 @@ def add_options(parser=None, usage=None):
 
     parser.add_argument('--radius', default=3.0, type=float,
         help='Radius of the source aperture in arcseconds.')
+    parser.add_argument('--idx', default=0, type=int,
+        help='HDU index to use for photometry.')
 
     return(parser)
 
@@ -78,10 +80,9 @@ sys.argv[2] = str(coord.ra.degree) ; sys.argv[3] = str(coord.dec.degree)
 parser = add_options()
 opt = parser.parse_args()
 
-def get_photometry(file, coord, radius=3, significant_figures=4):
+def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0):
     hdu = fits.open(file)
 
-    use_idx=0
     try:
         w = wcs.WCS(hdu[use_idx].header)
     except:
@@ -185,6 +186,7 @@ def get_photometry(file, coord, radius=3, significant_figures=4):
         return(mag, magerr)
 
 
-magnitude, error = get_photometry(filename, coord, radius=opt.radius)
+magnitude, error = get_photometry(filename, coord, radius=opt.radius,
+    use_idx=opt.idx)
 print('Got {0}+/-{1} at {2}, {3} for {4}'.format(magnitude, error,
     coord.ra.degree, coord.dec.degree, filename))

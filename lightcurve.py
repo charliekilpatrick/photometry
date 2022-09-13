@@ -1,12 +1,11 @@
+#!/usr/bin/env python3
+# Python 2/3 compatibility
 import requests, sys, shibboleth, os
 from astropy.io import ascii
 from astropy.time import Time
 from astropy.table import Table, Column, unique
 from dateutil.parser import parse
 import numpy as np
-import extinction
-import dustmaps.sfd
-dustmaps.sfd.fetch()
 
 import matplotlib.pyplot as plt
 from matplotlib import cm
@@ -35,11 +34,17 @@ telescopes = {
     'ztf': []
 }
 
-shibboleth = '/Users/ckilpatrick/scripts/shibboleth'
 filter_dir = 'FILTERS/'
 inst_dict = {'uvot':'Swift/UVOT',
              'sinistro': 'LCOGT 1m/Sinistro',
              'ztf cam': 'ZTF'}
+
+def is_number(num):
+    try:
+        num = float(num)
+    except ValueError:
+        return(False)
+    return(True)
 
 def get_filter_file(telescope, filt, instrument=None, wavelength=None):
     telescope = telescope.upper()
@@ -114,7 +119,12 @@ def plot_table(table, trim_outliers=True, plot_time='time', plot_mag='mag',
     for filt in uniq_filters:
         subtable = table[table['band']==filt]
 
-        time = [Time(t).mjd for t in subtable[plot_time]]
+        if is_number(subtable[plot_time][0]):
+            form='mjd'
+        else:
+            form=None
+
+        time = [Time(t, format=form).mjd for t in subtable[plot_time]]
         mag = [m for m in subtable[plot_mag]]
         err = [e for e in subtable[plot_mag+'_err']]
 
@@ -128,10 +138,11 @@ def plot_table(table, trim_outliers=True, plot_time='time', plot_mag='mag',
 
     plt.ylim(ymax+0.05*yran, ymin-0.05*yran)
 
-
     plt.legend(loc='upper right')
 
     plt.show()
+
+    plt.savefig('default.png')
 
 def sanitize_photometry_table(table, write=True):
 
@@ -163,10 +174,6 @@ def sanitize_photometry_table(table, write=True):
 
         # Add column
         table.add_column(col)
-
-    # Get rid of GPC1 data
-    match = table['instrument']!='GPC1'
-    table = table[match]
 
     # Get rid of unknown filters
     match = [f in filter_wavelengths.keys() for f in table['band']]
@@ -320,14 +327,15 @@ def correct_for_reddening(phottable, ebv, reddening=None):
     return(phottable)
 
 if len(sys.argv)<2:
-    usage = 'Usage: python lightcurve.py obj'
+    usage = 'Usage: lightcurve.py obj/file'
     print(usage)
     sys.exit()
 
-auth = authorize(shibboleth)
-table = yse_pz_phot(sys.argv[1], auth, check=True)
-table = sanitize_photometry_table(table, write=True)
+if os.path.exists(sys.argv[1]):
+    table = ascii.read(sys.argv[1])
+else:
+    auth = authorize('/Users/ckilpatrick/scripts/shibboleth')
+    table = yse_pz_phot(sys.argv[1], auth, check=True)
+    table = sanitize_photometry_table(table, write=True)
 
-print(table)
-
-plot_table(table)
+plot_table(table, trim_outliers=False)

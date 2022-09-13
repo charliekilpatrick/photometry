@@ -1,11 +1,42 @@
+#!/usr/bin/env python3
+# Python 2/3 compatibility
 from __future__ import print_function
+
+import warnings
+warnings.filterwarnings('ignore')
 from astropy.table import Table, vstack
 from astropy.io import fits
 from astropy.coordinates import SkyCoord
 from astropy import units as u
-import numpy as np, os, sys, warnings, glob
+import numpy as np, os, sys, warnings, glob, copy
 
 binned=False
+mask_best_detection=True
+
+def is_number(num):
+    try:
+        num = float(num)
+    except ValueError:
+        return(False)
+    return(True)
+
+def parse_coord(ra, dec):
+    if (not (is_number(ra) and is_number(dec)) and
+        (':' not in str(ra) and ':' not in str(dec))):
+        return(None)
+
+    if (':' in str(ra) and ':' in str(dec)):
+        # Input RA/DEC are sexagesimal
+        unit = (u.hourangle, u.deg)
+    else:
+        unit = (u.deg, u.deg)
+
+    try:
+        coord = SkyCoord(ra, dec, frame='icrs', unit=unit)
+        return(coord)
+    except ValueError:
+        return(None)
+
 
 def transpose(data):
     return(list(map(list, zip(*data))))
@@ -27,7 +58,13 @@ def import_cluster_file(filename):
                     else:
                         phothead=line.replace('#','').split()
                     if photdata:
-                        phottabs[str(photdata[0][0].strip())]=photdata
+                        key=str(photdata[0][0].strip())
+                        if key in phottabs.keys():
+                            currdata = phottabs[key]
+                            currdata.extend(photdata)
+                            phottabs[key] = currdata
+                        else:
+                            phottabs[key]=photdata
                         photdata=[]
                     table_count += 1
                     continue
@@ -50,11 +87,11 @@ def import_cluster_file(filename):
             phottabs[key] = Table(transpose(phottabs[key]), names=phothead)
         return(filetable, candtable, phottabs)
 
-def get_all_tables(table_dir):
+def get_all_tables(obj):
     files = None
     candidates = None
     photometry = []
-    for file in glob.glob(table_dir+'/*.clusters'):
+    for file in glob.glob(obj+'*.clusters'):
         filetable, candtable, phottabs = import_cluster_file(file)
         if not files:
             files = Table(filetable)
@@ -70,8 +107,6 @@ def get_all_tables(table_dir):
 
 def get_cand_id(coord, candidates):
 
-
-    print(candidates.keys())
     cand_coords = SkyCoord(candidates['RAaverage'],
         candidates['DECaverage'], unit=(u.hour, u.deg))
     sep = coord.separation(cand_coords)
@@ -83,18 +118,19 @@ def get_cand_id(coord, candidates):
         idx = np.argmin(sep)
         return(candidates[idx]['ID'])
 
-cand_ra='13:13:01.58'
-cand_dec='-19:30:45.11'
-cand_coord = SkyCoord(cand_ra, cand_dec, unit=(u.hour, u.deg))
 
-for subdir in ['2021fxy']:
-    files, candidates, photometry = get_all_tables(subdir)
+def parse_photometry(cand_ra, cand_dec, objname):
+
+    cand_coord = parse_coord(cand_ra, cand_dec)
+    files, candidates, photometry = get_all_tables(objname)
 
     cand_id = get_cand_id(cand_coord, candidates)
-    if not cand_id: continue
 
-    outdata = Table([[0.],[''],[0.],[0.],['X'*20]],
-        names=('MJD','FILTER','MAG','MAGERR','SOURCE')).copy()[:0]
+    if not cand_id: return(None)
+
+    outdata = Table([[0.],[''],[0.],[0.],['X'*20],[0.],[0.]],
+        names=('MJD','FILTER','MAG','MAGERR','SOURCE','FLUX',
+            'FLUXERR')).copy()[:0]
 
     mask=photometry[0][cand_id]['type']=='0x00000011'
     photometry[0][cand_id]=photometry[0][cand_id][mask]
@@ -115,48 +151,31 @@ for subdir in ['2021fxy']:
         if phot.endswith('16'): filt='z'
 
         source=''
-        print(phot)
         if '94' in str(phot): source='LULIN'
         if '4a' in str(phot): source='LCOGT'
 
-        outdata.add_row([float(mjd),filt,float(row['M'])+float(zpt),
-            float(row['dM'])+0.01,source])
+        if float(row['dM'])>0.3:
+            mag = float(-2.5*np.log10(10*float(row['dflux'])))+float(zpt)
+            magerr = 0.0
+        else:
+            mag = float(row['M'])+float(zpt)
+            magerr = float(row['dM'])+0.01
 
-    if binned:
-        minMJD=np.min(outdata['MJD'])-0.01
-        maxMJD=np.max(outdata['MJD'])
-        days=int(maxMJD-minMJD+1)
+        outdata.add_row([float(mjd), filt, mag, magerr, source,
+            float(row['flux']),float(row['dflux'])])
 
-        for d in np.linspace(np.min(outdata['MJD']),np.max(outdata['MJD']), days*4):
-            for filt in ['u','B','V','g','r','i','z']:
-                mask = (outdata['MJD']>d) & (outdata['MJD']<d+0.25) &\
-                    (outdata['FILTER']==filt) & (outdata['MAG']<30.0)
+    if mask_best_detection:
+        newtable = outdata.copy()[:0]
+        for mjd in np.unique(outdata['MJD']):
+            mask = outdata['MJD']==mjd
+            if len(outdata[mask])==1:
+                newtable.add_row(outdata[mask][0])
+            else:
+                # Add row with smallest FLUXERR
+                subtable = outdata[mask]
+                subtable.sort('FLUXERR')
+                newtable.add_row(subtable[0])
 
-                masked_data = outdata[mask]
-                if len(masked_data)==0: continue
-                elif len(masked_data)==1:
-                    print('%5.5f'%masked_data[0]['MJD'],masked_data[0]['FILTER'],
-                        '%5.3f'%masked_data[0]['MAG'],'%5.3f'%masked_data[0]['MAGERR'])
-                else:
-                    flux = 10**(-0.4*(masked_data['MAG'].data-27.5))
-                    fluxerr = flux * masked_data['MAGERR'].data/1.086
+        outdata = copy.copy(newtable)
 
-                    mean_flux = np.mean(flux)
-                    mean_fluxerr = np.sqrt(np.sum(1./len(masked_data)*fluxerr**2))
-
-                    mean_mag = -2.5*np.log10(mean_flux)+27.5
-                    mean_magerr = mean_fluxerr/mean_flux * 1.086
-
-                    mean_mjd = np.mean(masked_data['MJD'].data)
-
-                    source=masked_data['SOURCE'][0]
-
-                    print('%5.5f'%mean_mjd, masked_data[0]['FILTER'],
-                        '%5.3f'%mean_mag, '%5.3f'%mean_magerr)
-
-outdata.sort('MJD')
-for row in outdata:
-    out='{0} {1} {2} {3}'
-    out=out.format('%5.5f'%row['MJD'],row['FILTER'],'%5.3f'%row['MAG'],
-        '%5.3f'%row['MAGERR'])
-    print(out)
+    return(outdata)
