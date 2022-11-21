@@ -4,15 +4,96 @@ from __future__ import print_function
 
 import warnings
 warnings.filterwarnings('ignore')
-import os,sys
+import os
+import sys
+import copy
 import numpy as np
 import astropy.wcs as wcs
 from astropy.coordinates import SkyCoord
 from astropy import units as u
 from astropy.wcs import WCS
 from astropy.io import fits
+from scipy.optimize import curve_fit
 from photutils import SkyCircularAperture
 from photutils import CircularAnnulus,aperture_photometry
+
+def complex_background(data, x0, y0, radius_inner=4, radius_outer=16, order=1,
+    grow=4, test=False):
+
+    orig_data = copy.copy(data)
+
+    data_shape = data.shape
+    print('Shape',data_shape)
+
+    X=np.arange(data_shape[0])
+    Y=np.arange(data_shape[1])
+    XX,YY = np.meshgrid(X,Y)
+    distance = (XX-x0)**2 + (YY-y0)**2
+
+    rad_mask = (distance > radius_inner**2) & (distance < radius_outer**2)
+
+    Z = data[rad_mask]
+
+    # Mask excess emission in actual data
+    data_median = np.median(Z)
+    data_std = np.std(Z)
+
+    data_mask = data-data_median < 2 * data_std
+
+    all_mask = rad_mask & data_mask
+    if grow>0:
+        xval,yval=np.where(~all_mask)
+        for x1,y1 in zip(xval, yval):
+            all_mask[x1-int(grow/2):x1+int(grow/2),
+                y1-int(grow/2):y1+int(grow/2)]=False
+
+    XX = XX[all_mask]-x0
+    YY = YY[all_mask]-y0
+    Z = data[all_mask]
+
+    X = XX.ravel() ; Y = YY.ravel() ; Z = Z.ravel()
+
+    if test:
+        testhdu = fits.PrimaryHDU()
+        testdata = data
+        testdata[~all_mask]=np.nan
+        testhdu.data = testdata
+        testhdu.writeto('test.fits', overwrite=True)
+
+    xdata = np.vstack((Y, X))
+
+    if order==1:
+        def background(M, a, b, c, d):
+            x,y = M
+            z = a + b*x + c*x*y + d*y
+            return(z)
+        params = (np.median(data[~np.isnan(data)]), 1.0, 1.0, 1.0)
+    elif order==2:
+        def background(M, a, b, c, d, e, f, g):
+            x,y = M
+            z = a + b*x + c*x*y + d*y + e*x**2 + d*x*y**2 + e*x**2*y +\
+                f*y**2 + g*x**2*y**2
+            return(z)
+        params = (np.median(data[~np.isnan(data)]),
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    else:
+        raise Exception(f'STOP!  order={order} not allowed!')
+
+
+    popt, pcov = curve_fit(background, xdata, Z, params)
+
+    X = np.arange(data_shape[0])-x0
+    Y = np.arange(data_shape[1])-y0
+
+    XX, YY = np.meshgrid(X,Y)
+    xdata = np.vstack((YY.ravel(), XX.ravel()))
+
+    back_model = background(xdata, *popt)
+    back_model = np.reshape(back_model, data_shape)
+
+    back_sub = orig_data - back_model
+
+    return(back_model, back_sub)
 
 def is_number(num):
     try:
@@ -54,6 +135,11 @@ def add_options(parser=None, usage=None):
         help='Radius of the source aperture in arcseconds.')
     parser.add_argument('--idx', default=0, type=int,
         help='HDU index to use for photometry.')
+    parser.add_argument('--complex-background', default=False,
+        action='store_true', help='Fit with a spatially-varying background '+\
+        'around ra/dec')
+    parser.add_argument('--order', default=1, type=int,
+        help='Polynomial order of the complex background model')
 
     return(parser)
 
@@ -80,7 +166,8 @@ sys.argv[2] = str(coord.ra.degree) ; sys.argv[3] = str(coord.dec.degree)
 parser = add_options()
 opt = parser.parse_args()
 
-def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0):
+def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
+    use_complex_background=False, background_order=1):
     hdu = fits.open(file)
 
     try:
@@ -109,24 +196,64 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0):
         print('Exiting...')
         sys.exit()
 
+
+    use_data = hdu[use_idx].data
+
+    # If using complex background, first subtract a complex background model
+    # from a region around the source
+    if use_complex_background:
+        back_model, back_sub = complex_background(hdu[use_idx].data, x, y,
+            radius_inner=2*radius/pscale, radius_outer=8*radius/pscale)
+
+        half_size = int(8*radius/pscale)
+        x_int = int(np.round(x)) ; y_int = int(np.round(y))
+
+        data_extract = hdu[use_idx].data[y_int-half_size:y_int+half_size,
+            x_int-half_size:x_int+half_size]
+        back_extract = back_model[y_int-half_size:y_int+half_size,
+            x_int-half_size:x_int+half_size]
+        backsub_extract = back_sub[y_int-half_size:y_int+half_size,
+            x_int-half_size:x_int+half_size]
+
+        outdata = np.array([data_extract, back_extract, backsub_extract])
+        outheader = copy.copy(hdu[use_idx].header)
+        outheader['CRPIX1']=outheader['CRPIX1']-x_int/2
+        outheader['CRPIX2']=outheader['CRPIX2']-y_int/2
+
+        newhdu = fits.PrimaryHDU()
+        newhdu.data = outdata
+        newhdu.header = outheader
+
+        newhdu.writeto(file.replace('.fits','.stamp.fits'), overwrite=True,
+            output_verify='silentfix')
+
+        # Put back into data to continue with the remaining photometry methods
+        use_data = back_sub
+        newhdu = fits.PrimaryHDU()
+        newhdu.data = use_data
+        newhdu.header = hdu[use_idx].header
+        newhdu.writeto(file.replace('.fits','.sub.fits'), overwrite=True,
+            output_verify='silentfix')
+
     # Construct apertures for photometry and background
+    print(f'Radius is {radius} arcsec')
     aperture = SkyCircularAperture(coord, radius * u.arcsec)
-    phot_table = aperture_photometry(hdu[use_idx].data, aperture,
+    phot_table = aperture_photometry(use_data, aperture,
         wcs=WCS(hdu[use_idx].header), method='exact')
     phot = phot_table['aperture_sum'][0]
 
     pix_aperture = aperture.to_pixel(w)
 
     # Now get background estimation
-    # As default background aperture use an annulus with inner radius 2*radius
-    # and outer radius 4*radius
+    # As default background aperture use an annulus with inner radius
+    # and outer radius
     background = CircularAnnulus((x,y), r_in = 2 * radius/pscale,
-        r_out = 4 * radius/pscale)
+            r_out = 4 * radius/pscale)
     backmask = background.to_mask(method = 'center')
     if isinstance(backmask, list):
         backmask = backmask[0]
 
-    backdata = backmask.multiply(hdu[use_idx].data).flatten()
+    backdata = backmask.multiply(use_data).flatten()
     mask = backmask.data.flatten()!=0.0
     backdata = backdata[mask]
 
@@ -141,9 +268,9 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0):
         backdata = backdata[mask]
 
     # Rescale the background to the area of the circular aperture
+    print(f'Mean background value {mean}')
     back   = np.pi * pix_aperture.r**2 * mean
     counts = phot  - back
-
     backerr = np.std(backdata)
 
     # Metadata
@@ -175,18 +302,24 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0):
         zerr=hdu[use_idx].header['ZPTMUCER']
         print('zpterr:',hdu[use_idx].header['ZPTMUCER'])
 
+    mlimit = -2.5*np.log10(3 * np.sqrt(np.pi * pix_aperture.r**2 * backerr**2))
+    mlimit = mlimit + zpt
+
     print('Counts, phot, background:',counts,phot,back)
     if np.isnan(mag) or np.isnan(merr):
-        return(np.NaN, np.NaN)
+        return(np.NaN, np.NaN, np.NaN)
     else:
         fmt='%2.{0}f'.format(significant_figures)
         mag=mag+zpt ; magerr=np.sqrt(merr**2+zerr**2)
         mag=float(fmt%mag)
         magerr=float(fmt%magerr)
-        return(mag, magerr)
+        return(mag, magerr, mlimit)
 
 
-magnitude, error = get_photometry(filename, coord, radius=opt.radius,
-    use_idx=opt.idx)
+magnitude, error, mlimit = get_photometry(filename, coord, radius=opt.radius,
+    use_idx=opt.idx, use_complex_background=opt.complex_background,
+    background_order=opt.order)
+print(filename)
 print('Got {0}+/-{1} at {2}, {3} for {4}'.format(magnitude, error,
     coord.ra.degree, coord.dec.degree, filename))
+print(f'Limiting magnitude is {mlimit}')
