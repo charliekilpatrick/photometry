@@ -14,8 +14,10 @@ from astropy import units as u
 from astropy.wcs import WCS
 from astropy.io import fits
 from scipy.optimize import curve_fit
-from photutils import SkyCircularAperture
+from photutils import SkyCircularAperture,CircularAperture
 from photutils import CircularAnnulus,aperture_photometry
+
+import matplotlib.pyplot as plt
 
 def complex_background(data, x0, y0, radius_inner=4, radius_outer=16, order=1,
     grow=4, test=False):
@@ -140,6 +142,8 @@ def add_options(parser=None, usage=None):
         'around ra/dec')
     parser.add_argument('--order', default=1, type=int,
         help='Polynomial order of the complex background model')
+    parser.add_argument('--plots', default=False, action='store_true',
+        help='Make diagnostic plots for aperture data.')
 
     return(parser)
 
@@ -167,7 +171,7 @@ parser = add_options()
 opt = parser.parse_args()
 
 def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
-    use_complex_background=False, background_order=1):
+    use_complex_background=False, background_order=1, make_plots=False):
     hdu = fits.open(file)
 
     try:
@@ -198,6 +202,45 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
 
 
     use_data = hdu[use_idx].data
+
+    # Construct apertures for photometry
+    print(f'Radius is {radius} arcsec')
+    aperture = SkyCircularAperture(coord, radius * u.arcsec)
+
+    if make_plots:
+        data_shape = use_data.shape
+
+        X=np.arange(data_shape[0])
+        Y=np.arange(data_shape[1])
+        XX,YY = np.meshgrid(X,Y)
+
+        distance = (XX-x)**2 + (YY-y)**2
+
+        rad_mask = distance < (2*radius/pscale)**2
+
+        Z = use_data[rad_mask].ravel()
+        distance = np.sqrt(distance[rad_mask].ravel())
+
+        print(Z)
+        print(distance)
+
+        fig, ax = plt.subplots()
+        for rad, dat in zip(distance, Z):
+            ax.plot(rad, dat, 'o', color='k')
+
+        min_val = np.min(Z)
+        max_val = np.max(Z)
+
+        data_range = max_val - min_val
+        yrange = [min_val-0.05*data_range, max_val+0.05*data_range]
+        ax.set_ylim(yrange)
+
+        ax.set_xlabel('Distance from Apeture Center in Pixels')
+        ax.set_ylabel('Pixel Value')
+
+        ax.vlines(radius/pscale,*yrange)
+
+        plt.savefig(file.replace('.fits','.radial.png'))
 
     # If using complex background, first subtract a complex background model
     # from a region around the source
@@ -235,9 +278,7 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
         newhdu.writeto(file.replace('.fits','.sub.fits'), overwrite=True,
             output_verify='silentfix')
 
-    # Construct apertures for photometry and background
-    print(f'Radius is {radius} arcsec')
-    aperture = SkyCircularAperture(coord, radius * u.arcsec)
+    # Do photometry on the input data
     phot_table = aperture_photometry(use_data, aperture,
         wcs=WCS(hdu[use_idx].header), method='exact')
     phot = phot_table['aperture_sum'][0]
@@ -254,6 +295,7 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
         backmask = backmask[0]
 
     backdata = backmask.multiply(use_data).flatten()
+    # These pixels may be masked, so get rid of them
     mask = backmask.data.flatten()!=0.0
     backdata = backdata[mask]
 
@@ -318,7 +360,7 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
 
 magnitude, error, mlimit = get_photometry(filename, coord, radius=opt.radius,
     use_idx=opt.idx, use_complex_background=opt.complex_background,
-    background_order=opt.order)
+    background_order=opt.order, make_plots=opt.plots)
 print(filename)
 print('Got {0}+/-{1} at {2}, {3} for {4}'.format(magnitude, error,
     coord.ra.degree, coord.dec.degree, filename))
