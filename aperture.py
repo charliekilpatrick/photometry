@@ -221,24 +221,32 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
         Z = use_data[rad_mask].ravel()
         distance = np.sqrt(distance[rad_mask].ravel())
 
-        print(Z)
-        print(distance)
-
         fig, ax = plt.subplots()
         for rad, dat in zip(distance, Z):
             ax.plot(rad, dat, 'o', color='k')
+
+        ax2 = ax.twiny()
+        def pscale_function(x):
+            return(pscale * x)
 
         min_val = np.min(Z)
         max_val = np.max(Z)
 
         data_range = max_val - min_val
-        yrange = [min_val-0.05*data_range, max_val+0.05*data_range]
-        ax.set_ylim(yrange)
+        y_range = [min_val-0.05*data_range, max_val+0.05*data_range]
+        x_range = [0., 2.0 * radius / pscale]
+        ax.set_ylim(y_range)
+        ax.set_xlim(x_range)
+
+        x_ticks = ax.get_xticks()
+        xtick_labels = ['%2.2f'%float(val) for val in pscale_function(x_ticks)]
+        ax2.set_xticklabels(xtick_labels)
+        ax2.set_xlabel('Distance from Aperture Center in arcsec')
 
         ax.set_xlabel('Distance from Apeture Center in Pixels')
         ax.set_ylabel('Pixel Value')
 
-        ax.vlines(radius/pscale,*yrange)
+        ax.vlines(radius/pscale,*y_range)
 
         plt.savefig(file.replace('.fits','.radial.png'))
 
