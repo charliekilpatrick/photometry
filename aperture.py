@@ -240,6 +240,9 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
 
         x_ticks = ax.get_xticks()
         xtick_labels = ['%2.2f'%float(val) for val in pscale_function(x_ticks)]
+        ax.set_xticks(x_ticks)
+        ax.set_xticklabels(x_ticks)
+        ax2.set_xticks(x_ticks)
         ax2.set_xticklabels(xtick_labels)
         ax2.set_xlabel('Distance from Aperture Center in arcsec')
 
