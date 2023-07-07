@@ -13,6 +13,7 @@ from astropy.coordinates import SkyCoord
 from astropy import units as u
 from astropy.wcs import WCS
 from astropy.io import fits
+from astropy.time import Time
 from scipy.optimize import curve_fit
 from photutils import SkyCircularAperture,CircularAperture
 from photutils import CircularAnnulus,aperture_photometry
@@ -144,6 +145,8 @@ def add_options(parser=None, usage=None):
         help='Polynomial order of the complex background model')
     parser.add_argument('--plots', default=False, action='store_true',
         help='Make diagnostic plots for aperture data.')
+    parser.add_argument('--verbose', default=False,
+        action='store_true', help='Verbose output.')
 
     return(parser)
 
@@ -171,7 +174,9 @@ parser = add_options()
 opt = parser.parse_args()
 
 def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
-    use_complex_background=False, background_order=1, make_plots=False):
+    use_complex_background=False, background_order=1, make_plots=False,
+    verbose=False):
+
     hdu = fits.open(file)
 
     try:
@@ -182,12 +187,24 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
         sys.exit()
 
     header = hdu[use_idx].header
+    h = hdu[use_idx].header
+
+    mjd=0.0
+    if 'DATE-OBS' in h.keys() and 'TIME-OBS' in h.keys():
+        t = Time(h['DATE-OBS']+'T'+h['TIME-OBS'])
+        mjd=float('%5.8f'%float(t.mjd))
+    elif 'MJD-OBS' in h.keys():
+        print('MJD:','%5.8f'%float(h['MJD-OBS']))
+        mjd=float('%5.8f'%float(h['MJD-OBS']))
+    elif 'DATE_OBS' in h.keys():
+        t = Time(h['DATE_OBS'])
+        mjd=float('%5.8f'%float(t.mjd))
 
     if 'CD1_1' in header.keys() and 'CD1_2' in header.keys():
         pscale = np.sqrt(float(header['CD1_1'])**2+float(header['CD1_2'])**2)
-        pscale = pscale * 3600.
+        pscale = np.abs(pscale * 3600.)
     elif 'CDELT1' in header.keys():
-        pscale = float(header['CDELT1']) * 3600.0
+        pscale = np.abs(float(header['CDELT1']) * 3600.0)
     else:
         print('ERROR: could not parse WCS keywords for {0}'.format(file))
         print('Exiting...')
@@ -196,15 +213,19 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
     x,y = wcs.utils.skycoord_to_pixel(coord, w, origin=1, mode='wcs')
 
     if x < 0 or x > header['NAXIS1'] or y < 0 or y > header['NAXIS2']:
-        print(x,y,'not in',file)
-        print('Exiting...')
+        if verbose:
+            print(x,y,'not in',file)
+            print('Exiting...')
+        else:
+            print(file,mjd,np.nan,np.nan)
         sys.exit()
 
 
     use_data = hdu[use_idx].data
 
     # Construct apertures for photometry
-    print(f'Radius is {radius} arcsec')
+    if verbose:
+        print(f'Radius is {radius} arcsec')
     aperture = SkyCircularAperture(coord, radius * u.arcsec)
 
     if make_plots:
@@ -244,8 +265,8 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
         ax.set_xticklabels(x_ticks)
         ax2.set_xticks(x_ticks)
         ax2.set_xticklabels(xtick_labels)
-        ax2.set_xlabel('Distance from Aperture Center in arcsec')
 
+        ax2.set_xlabel('Distance from Aperture Center in arcsec')
         ax.set_xlabel('Distance from Apeture Center in Pixels')
         ax.set_ylabel('Pixel Value')
 
@@ -299,6 +320,8 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
     # Now get background estimation
     # As default background aperture use an annulus with inner radius
     # and outer radius
+    if verbose:
+        print(f'r_in={2*radius/pscale}, r_out={4*radius/pscale}')
     background = CircularAnnulus((x,y), r_in = 2 * radius/pscale,
             r_out = 4 * radius/pscale)
     backmask = background.to_mask(method = 'center')
@@ -308,6 +331,9 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
     backdata = backmask.multiply(use_data).flatten()
     # These pixels may be masked, so get rid of them
     mask = backmask.data.flatten()!=0.0
+    backdata = backdata[mask]
+
+    mask = ~np.isnan(backdata)
     backdata = backdata[mask]
 
     # Get sigma-clipped median
@@ -321,7 +347,8 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
         backdata = backdata[mask]
 
     # Rescale the background to the area of the circular aperture
-    print(f'Mean background value {mean}')
+    if verbose:
+        print(f'Mean background value {mean}')
     back   = np.pi * pix_aperture.r**2 * mean
     counts = phot  - back
     backerr = np.std(backdata)
@@ -340,39 +367,64 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
     zerr=0.0
     if 'ZPTMAG' in hdu[use_idx].header.keys():
         zpt=hdu[use_idx].header['ZPTMAG']
-        print('zeropoint:',zpt)
     elif 'MAGZERO' in hdu[use_idx].header.keys():
         zpt=hdu[use_idx].header['MAGZERO']
-        print('zeropoint:',zpt)
     elif 'PHOTZP' in hdu[use_idx].header.keys():
         zpt=hdu[use_idx].header['PHOTZP']
-        print('zeropoint:',zpt)
     elif 'FPA.ZP' in hdu[use_idx].header.keys():
         zpt=hdu[use_idx].header['FPA.ZP']
         zpt+=2.5*np.log10(hdu[use_idx].header['EXPTIME'])
-        print('zeropoint:',zpt)
+    elif 'ORIGZPT' in hdu[use_idx].header.keys():
+        zpt=hdu[use_idx].header['ORIGZPT']
+        zpt+=2.5*np.log10(hdu[use_idx].header['EXPTIME'])
+    elif 'PHOTFLAM' in hdu[use_idx].header.keys():
+        PHOTFLAM=hdu[use_idx].header['PHOTFLAM']
+        PHOTPLAM=hdu[use_idx].header['PHOTPLAM']
+        zpt=-2.5*np.log10(PHOTFLAM)-5*np.log10(PHOTPLAM)-2.408
+        #zpt+=2.5*np.log10(hdu[use_idx].header['EXPTIME'])
+    elif 'BUNIT' in h.keys() and h['BUNIT']=='MJy/sr':
+        zpt=-2.5*np.log10(pscale*pscale*23.5045*1.0e-6/3631.0)
     if 'ZPTMUCER' in hdu[use_idx].header.keys():
         zerr=hdu[use_idx].header['ZPTMUCER']
-        print('zpterr:',hdu[use_idx].header['ZPTMUCER'])
+
+    if verbose:
+        print('zeropoint:',zpt)
+
 
     mlimit = -2.5*np.log10(3 * np.sqrt(np.pi * pix_aperture.r**2 * backerr**2))
     mlimit = mlimit + zpt
 
-    print('Counts, phot, background:',counts,phot,back)
+    if verbose:
+        print('Counts, phot, background, backerr:',counts,phot,back,backerr)
+    
+    fmt='%2.{0}f'.format(significant_figures)
+
     if np.isnan(mag) or np.isnan(merr):
-        return(np.NaN, np.NaN, np.NaN)
+        mag=np.NaN
+        magerr=np.NaN
     else:
-        fmt='%2.{0}f'.format(significant_figures)
         mag=mag+zpt ; magerr=np.sqrt(merr**2+zerr**2)
         mag=float(fmt%mag)
         magerr=float(fmt%magerr)
-        return(mag, magerr, mlimit)
+
+    mlimit=float(fmt%mlimit)
+
+    data = {'mag': mag,
+            'magerr':magerr,
+            'mlimit':mlimit,
+            'mjd':mjd,
+            }
+    return(data)
 
 
-magnitude, error, mlimit = get_photometry(filename, coord, radius=opt.radius,
+data = get_photometry(filename, coord, radius=opt.radius,
     use_idx=opt.idx, use_complex_background=opt.complex_background,
     background_order=opt.order, make_plots=opt.plots)
-print(filename)
-print('Got {0}+/-{1} at {2}, {3} for {4}'.format(magnitude, error,
+if opt.verbose:
+    print('Got {0}+/-{1} at {2}, {3} for {4}'.format(data['mag'], data['magerr'],
     coord.ra.degree, coord.dec.degree, filename))
-print(f'Limiting magnitude is {mlimit}')
+mlimit=data['mlimit']
+if opt.verbose:
+    print(f'Limiting magnitude is {mlimit}')
+
+print(filename,data['mjd'],data['mag'],data['magerr'])

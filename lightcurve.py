@@ -13,25 +13,45 @@ from matplotlib import cm
 import pysynphot as S
 S.setref(area = 25.0 * 10000)
 
+def add_options(parser=None, usage=None):
+    import argparse
+    if parser == None:
+        parser = argparse.ArgumentParser(usage=usage,conflict_handler='resolve')
+
+    parser.add_argument('filename', type=str,
+        help='Right ascension to reduce the HST images')
+    parser.add_argument('--filter','-f', type=str, default=None,
+        help='Comma-separated list of filters to plot')
+    parser.add_argument('--t_range', type=str, default=None,
+        help='Comma-separated list of time range to plot (e.g., 58500,58600)')
+    parser.add_argument('--update', default=False, action='store_true',
+        help='Instead of plotting once, refresh plot on user input')
+    parser.add_argument('--compare', default='', type=str,
+        help='Plot data from input file with different symbol for comparison.')
+    parser.add_argument('--mask', default=False, action='store_true',
+        help='Mask out nan and negative values instead of throwing an error.')
+
+    return(parser)
+
 # For the purposes of ordering, roughly the wavelength of
 # each filter contained in YSE PZ.
 filter_wavelengths = {
     'u': 3543,'g': 4770,'r': 6231,'i': 7625,'z': 8660,'y': 9620,'U': 3640,
     'B': 4420,'V': 5400,'R': 6349,'I': 8797,'up': 3540,'gp': 4750,'rp': 6222,
     'ip': 7632,'zp': 9049,'Y': 10200,'J': 12200,'H': 16300,'K': 21900,
-    'UVW1': 2600,'UVM2': 2246,'UVW2': 1928
+    'UVW1': 2600,'UVM2': 2246,'UVW2': 1928, 'zs': 8260,
 }
 
 temp_wave = 1.0 + np.arange(60000)
 
 telescopes = {
     'swope': ['u','B','V','g','r','i'],
-    'lcogt': ['U','B','V','R','I','up','gp','rp','ip'],
+    'lcogt': ['U','B','V','R','I','up','gp','rp','ip','zs'],
     'hst': [],
     'spitzer': ['I1','I2'],
     'swift': ['U','B','V','UVM2','UVW1','UVW2','W'],
     'atlas': ['orange','cyan'],
-    'ztf': []
+    'ztf': [],
 }
 
 filter_dir = 'FILTERS/'
@@ -92,9 +112,15 @@ def get_filter_file(telescope, filt, instrument=None, wavelength=None):
         return(bpmodel)
 
 def plot_table(table, trim_outliers=True, plot_time='time', plot_mag='mag',
-    absolute=False):
+    absolute=False, plot_bands=[], t_range=[], compare=''):
     uniq_filters = np.unique(table['band'])
     uniq_filters = sorted(uniq_filters, key=lambda f: filter_wavelengths[f])
+
+    if plot_bands:
+        uniq_filters = np.array([u for u in uniq_filters if u in plot_bands])
+
+    mask = np.array([t['band'] in uniq_filters for t in table])
+    table = table[mask]
 
     # Get an array of colors for plotting different bands
     gradient = np.linspace(0, 1, 256)
@@ -131,18 +157,36 @@ def plot_table(table, trim_outliers=True, plot_time='time', plot_mag='mag',
         plt.plot(time, mag, 'o', linestyle='None', label=filt)
         plt.errorbar(time, mag, yerr=err, linestyle='None')
 
+    if compare:
+        ctable = get_data(compare)
+
+        for filt in uniq_filters:
+            subtable = ctable[ctable['band']==filt]
+            if len(subtable)==0:
+                continue
+
+            if is_number(subtable[plot_time][0]):
+                form='mjd'
+            else:
+                form=None
+
+            time = [Time(t, format=form).mjd for t in subtable[plot_time]]
+            mag = [m for m in subtable[plot_mag]]
+            err = [e for e in subtable[plot_mag+'_err']]
+
+            plt.plot(time, mag, '*', linestyle='None', label=filt)
+            plt.errorbar(time, mag, yerr=err, linestyle='None')
+
     # y limit adjustment
     ymax = np.max(table[plot_mag]+table[plot_mag+'_err'])
     ymin = np.min(table[plot_mag]-table[plot_mag+'_err'])
     yran = (ymax - ymin)
 
+    if len(t_range)==2:
+        plt.xlim(t_range[0], t_range[1])
+
     plt.ylim(ymax+0.05*yran, ymin-0.05*yran)
-
     plt.legend(loc='upper right')
-
-    plt.show()
-
-    plt.savefig('default.png')
 
 def sanitize_photometry_table(table, write=True):
 
@@ -297,6 +341,7 @@ def correct_for_reddening(phottable, ebv, reddening=None):
     if not reddening:
         reddening={'u':4.239,'g':3.303,'r':2.285,'i':1.698,'z':1.263,
            'up':4.239,'gp':3.303,'rp':2.285,'ip':1.698,'zp':1.263,
+           'zs': 1.3,
            'cyan':2.742,'orange':1.921,'G':2.171,
           'U':4.107,'B':3.641,'V':2.682,'R':2.119,'I':1.516,
           'J':0.709,'H':0.449,'K':0.302}
@@ -326,16 +371,67 @@ def correct_for_reddening(phottable, ebv, reddening=None):
     phottable.meta['MW_reddening']=True
     return(phottable)
 
+def get_data(filename, mask=False):
+    table = None
+
+    if not mask:
+        # Check for nan and negative magnitude values before plotting
+        with open(filename, 'r') as f:
+            for line in f:
+                mag = line.split()[2]
+                if np.isnan(float(mag)):
+                    raise Exception(f'ERROR: {filename} contains nan values')
+                elif float(mag)<0.0:
+                    raise Exception(f'ERROR: {filename} contains negative '+\
+                        '(uncalibrated) magnitude values')
+
+    if os.path.exists(filename):
+        table = ascii.read(filename, names=('time','band','mag','mag_err'))
+        mask_col = ~np.isnan(table['mag']) & (table['mag']>0.0)
+        table = table[mask_col]
+    else:
+        auth = authorize('/Users/ckilpatrick/scripts/shibboleth')
+        table = yse_pz_phot(filename, auth, check=True)
+        table = sanitize_photometry_table(table, write=True)
+
+    if table is None:
+        raise Exception('ERROR: no input data from file or YSE-PZ!')
+
+    return(table)
+
+
+# Parse arguments
 if len(sys.argv)<2:
     usage = 'Usage: lightcurve.py obj/file'
     print(usage)
     sys.exit()
 
-if os.path.exists(sys.argv[1]):
-    table = ascii.read(sys.argv[1])
-else:
-    auth = authorize('/Users/ckilpatrick/scripts/shibboleth')
-    table = yse_pz_phot(sys.argv[1], auth, check=True)
-    table = sanitize_photometry_table(table, write=True)
+parser = add_options()
+args = parser.parse_args()
 
-plot_table(table, trim_outliers=False)
+plot_bands=[]
+if args.filter is not None:
+    plot_bands = args.filter.split(',')
+
+t_range = []
+if args.t_range is not None:
+    t_range = [float(s) for s in args.t_range.split(',')]
+
+if args.update:
+    stop = False
+    while not stop:
+        table = get_data(args.filename, mask=args.mask)
+        plt.clf()
+        plot_table(table, trim_outliers=False, plot_bands=plot_bands,
+            t_range=t_range, compare=args.compare)
+        plt.show()
+
+        x = input('Remake the plot ([y]/n)? ')
+        if 'n' in x:
+            stop = True
+
+else:
+    table = get_data(args.filename, mask=args.mask)
+    plot_table(table, trim_outliers=False, plot_bands=plot_bands,
+            t_range=t_range, compare=args.compare)
+    plt.show()
