@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Python 2/3 compatibility
-import requests, sys, shibboleth, os
+import requests, sys, os
 from astropy.io import ascii
 from astropy.time import Time
 from astropy.table import Table, Column, unique
@@ -230,15 +230,7 @@ def sanitize_photometry_table(table, write=True):
 
     return(table)
 
-def authorize(shibboleth):
-    table = ascii.read(shibboleth, names=['type','username','password'])
-    s = table[table['type']=='yse'][0]
-    url = 'https://ziggy.ucolick.org/yse/download_data/'
-    auth = requests.auth.HTTPBasicAuth(s['username'], s['password'])
-
-    return(auth)
-
-def yse_pz_phot(objname, auth, check=True):
+def yse_pz_phot(objname, check=True):
 
     if os.path.exists(objname+'.phot'):
         table = ascii.read(objname+'.phot')
@@ -246,7 +238,7 @@ def yse_pz_phot(objname, auth, check=True):
 
     url = 'https://ziggy.ucolick.org/yse/download_data/'
 
-    data = requests.get(url + objname, auth=auth)
+    data = requests.get(url + objname)
 
     if 'Server Error' in data.text:
         error = 'ERROR: could not get data for {obj} from YSE PZ\n'
@@ -390,8 +382,7 @@ def get_data(filename, mask=False):
         mask_col = ~np.isnan(table['mag']) & (table['mag']>0.0)
         table = table[mask_col]
     else:
-        auth = authorize('/Users/ckilpatrick/scripts/shibboleth')
-        table = yse_pz_phot(filename, auth, check=True)
+        table = yse_pz_phot(filename, check=True)
         table = sanitize_photometry_table(table, write=True)
 
     if table is None:

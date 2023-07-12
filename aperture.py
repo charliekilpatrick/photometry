@@ -15,8 +15,13 @@ from astropy.wcs import WCS
 from astropy.io import fits
 from astropy.time import Time
 from scipy.optimize import curve_fit
-from photutils import SkyCircularAperture,CircularAperture
-from photutils import CircularAnnulus,aperture_photometry
+
+# photutils dependencies
+from photutils import SkyCircularAperture
+from photutils import SkyEllipticalAperture
+from photutils import CircularAperture
+from photutils import CircularAnnulus
+from photutils import aperture_photometry
 
 import matplotlib.pyplot as plt
 
@@ -128,11 +133,11 @@ def add_options(parser=None, usage=None):
         parser = argparse.ArgumentParser(usage=usage,conflict_handler='resolve')
 
     parser.add_argument('filename', type=str,
-        help='Right ascension to reduce the HST images')
+        help='Input filename')
     parser.add_argument('ra', type=str,
-        help='Right ascension to reduce the HST images')
+        help='Right ascension to place aperture')
     parser.add_argument('dec', type=str,
-        help='Right ascension to reduce the HST images')
+        help='Declination to place aperture')
 
     parser.add_argument('--radius', default=3.0, type=float,
         help='Radius of the source aperture in arcseconds.')
@@ -147,6 +152,9 @@ def add_options(parser=None, usage=None):
         help='Make diagnostic plots for aperture data.')
     parser.add_argument('--verbose', default=False,
         action='store_true', help='Verbose output.')
+    parser.add_argument('--elliptical', nargs=3, type=float, default=None,
+        help='semi-major axis (arcsec), semi-minor  (arcsec), and'+\
+        ' position angle (in deg) from positive x axis.')
 
     return(parser)
 
@@ -175,7 +183,7 @@ opt = parser.parse_args()
 
 def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
     use_complex_background=False, background_order=1, make_plots=False,
-    verbose=False):
+    verbose=False, elliptical=None):
 
     hdu = fits.open(file)
 
@@ -226,7 +234,16 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
     # Construct apertures for photometry
     if verbose:
         print(f'Radius is {radius} arcsec')
-    aperture = SkyCircularAperture(coord, radius * u.arcsec)
+
+    if elliptical:
+        semimajor = elliptical[0]
+        semiminor = elliptical[1]
+        position_angle = elliptical[2]
+
+        aperture = SkyEllipticalAperture(coord, semimajor * u.arcsec,
+            semiminor * u.arcsec, position_angle * u.deg)
+    else:
+        aperture = SkyCircularAperture(coord, radius * u.arcsec)
 
     if make_plots:
         data_shape = use_data.shape
@@ -360,7 +377,6 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
     mag = -2.5 * np.log10(counts)
 
     # Statistical uncertainty on instrumental magnitude
-    #merr = 1.086*np.sqrt(1/np.abs(counts) + 1/np.abs(back))
     merr = 1.086 * np.sqrt(np.pi * pix_aperture.r**2 * backerr**2)/counts
 
     zpt=0.0
@@ -381,7 +397,7 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
         PHOTFLAM=hdu[use_idx].header['PHOTFLAM']
         PHOTPLAM=hdu[use_idx].header['PHOTPLAM']
         zpt=-2.5*np.log10(PHOTFLAM)-5*np.log10(PHOTPLAM)-2.408
-        #zpt+=2.5*np.log10(hdu[use_idx].header['EXPTIME'])
+        zpt+=2.5*np.log10(hdu[use_idx].header['EXPTIME'])
     elif 'BUNIT' in h.keys() and h['BUNIT']=='MJy/sr':
         zpt=-2.5*np.log10(pscale*pscale*23.5045*1.0e-6/3631.0)
     if 'ZPTMUCER' in hdu[use_idx].header.keys():
@@ -412,19 +428,16 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
     data = {'mag': mag,
             'magerr':magerr,
             'mlimit':mlimit,
-            'mjd':mjd,
-            }
+            'mjd':mjd,}
     return(data)
 
 
 data = get_photometry(filename, coord, radius=opt.radius,
     use_idx=opt.idx, use_complex_background=opt.complex_background,
-    background_order=opt.order, make_plots=opt.plots)
+    background_order=opt.order, make_plots=opt.plots, elliptical=opt.elliptical)
 if opt.verbose:
-    print('Got {0}+/-{1} at {2}, {3} for {4}'.format(data['mag'], data['magerr'],
-    coord.ra.degree, coord.dec.degree, filename))
+    print('Got {0}+/-{1} at {2}, {3} for {4}'.format(data['mag'],data['magerr'],
+        coord.ra.degree,coord.dec.degree,filename))
 mlimit=data['mlimit']
 if opt.verbose:
     print(f'Limiting magnitude is {mlimit}')
-
-print(filename,data['mjd'],data['mag'],data['magerr'])
