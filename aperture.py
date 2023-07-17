@@ -14,7 +14,11 @@ from astropy import units as u
 from astropy.wcs import WCS
 from astropy.io import fits
 from astropy.time import Time
+from astropy.stats import sigma_clipped_stats
 from scipy.optimize import curve_fit
+from scipy.stats import sigmaclip
+#from Gaussians import fix_x0
+
 
 # photutils dependencies
 from photutils import SkyCircularAperture
@@ -22,8 +26,105 @@ from photutils import SkyEllipticalAperture
 from photutils import CircularAperture
 from photutils import CircularAnnulus
 from photutils import aperture_photometry
+from photutils.background import MADStdBackgroundRMS
+from photutils.detection import IRAFStarFinder
 
 import matplotlib.pyplot as plt
+
+def curve_of_growth_fnc(img_file, fwhm_init=5.0, threshold=3.5, diagnostic_plots=True):
+    '''
+    Function to calculate the curve-of-growth correction for performing aperture photometry
+    on objects smaller than the PSF of the image. Uses code from POTPyRI psf.py.
+
+    Inputs:
+            img_file [fits]: File to perform photometry on
+            fwhm_init [float]: full-width at half-maximum of stars
+            threshold [float]: minimum value for source selection
+            diagnostic_plots [boolean]: When True, returns plot of curve-of-growth
+    Outputs:
+            COG_corr []: Curve-of-growth aperture correction factor (in AB magnitudes)
+
+    '''
+    # step 1: identify stars
+    img_hdu = fits.open(img_file)
+    data = img_hdu[0].data
+
+    bkgrms = MADStdBackgroundRMS()
+    std = bkgrms(data)
+    iraffind = IRAFStarFinder(threshold=threshold*std,
+        fwhm=fwhm_init, minsep_fwhm=0.5,
+        roundhi=0.2, roundlo=0.1, sharplo=0.4, sharphi=1.0)
+
+    stars = iraffind(data)
+    
+    # get some statistics for next step
+    mask = img_hdu[0].data!=0.0
+    mean, median, std_sky = sigma_clipped_stats(img_hdu[0].data[mask],
+        sigma=5.0)
+
+    ##############################################################
+
+    # step 2: ensure stars are point sources
+    mask = ((stars['xcentroid'] > 50) & (stars['xcentroid'] < (data.shape[1] -51))
+                & (stars['ycentroid'] > 50) & (stars['ycentroid'] < (data.shape[0] -51)))
+    stars = stars[mask]
+
+    stars = stars['xcentroid', 'ycentroid', 'fwhm', 'sharpness', 'roundness', 
+        'npix', 'pa', 'flux', 'sky']
+
+    # estimate flux uncertainty
+    stars['flux_err'] = np.sqrt(stars['flux']+stars['npix']*stars['sky'])
+
+    # mask based on sharpness and roundness
+    mask = ((stars['sharpness'] < np.median(stars['sharpness'])+np.std(stars['sharpness'])) &\
+                (stars['roundness'] < np.median(stars['roundness'])+3*np.std(stars['roundness'])) &\
+                (stars['roundness'] > np.median(stars['roundness'])-3*np.std(stars['roundness'])))
+    fwhm_stars = stars[mask]
+
+    # mask based on FWHM
+    fwhm_clipped, _, _ = sigmaclip(fwhm_stars['fwhm'])
+    fwhm = np.median(fwhm_clipped)
+    std_fwhm = np.std(fwhm_clipped)
+    mask = (fwhm_stars['fwhm'] > fwhm-3*std_fwhm) &\
+        (fwhm_stars['fwhm'] < fwhm+3*std_fwhm)
+    fwhm_stars = fwhm_stars[mask]
+    fwhm = np.median(fwhm_stars['fwhm'])
+
+    ##############################################################
+    
+    # step 3: apply circular apertures to stars for a range of FWHM and do photometry
+    step_size = 0.1
+    radii = np.arange(0.25*fwhm, 4*fwhm, step_size)
+    x_data = np.arange(0, 4*fwhm, step_size)
+    apers_area = [np.pi*(step_size**2)]
+
+    for r in radii:
+        apers_area.append(np.pi*((r+step_size)**2 - r**2))
+    
+    coords = [(fwhm_stars['xcentroid'][i],fwhm_stars['ycentroid'][i]) for i in range(len(fwhm_stars))]
+    apertures = [CircularAperture(coords, r=step_size)]     # For circle aperture around center
+    
+    for r in radii:
+        apertures.append(CircularAnnulus(coords, r_in=r, r_out=r+step_size))  # Annuli apertures
+
+    phot_table = aperture_photometry(img_hdu[0].data, apertures)
+
+    ##############################################################
+
+    # step 4: make curve_of_growth plot to check it worked
+    #if diagnostic_plots==True:
+    #    plt.scatter(apertures[0], phot_table['aperture_sum'][0]) # aperture sum vs aperture size <- not functional but this idea
+
+    ##############################################################
+
+    # step 5: calculate curve_of_growth correction factor
+    # COG_corr = flux @ r<FWHM / flux @ FWHM
+
+    # step 6: convert to a magnitude
+    # flux to mag conversion here? or more complicated as COG corr isn't really a flux
+    # COG_corr = X magnitudes
+
+    return #COG_corr
 
 def complex_background(data, x0, y0, radius_inner=4, radius_outer=16, order=1,
     grow=4, test=False):
@@ -155,6 +256,10 @@ def add_options(parser=None, usage=None):
     parser.add_argument('--elliptical', nargs=3, type=float, default=None,
         help='semi-major axis (arcsec), semi-minor  (arcsec), and'+\
         ' position angle (in deg) from positive x axis.')
+    parser.add_argument('--curve_of_growth', default=False,
+        action='store_true', help='Perform curve-of-growth correction.')
+    parser.add_argument('--fwhm', default=3.0, type=float,
+        help='FWHM of the PSF in pixels.')
 
     return(parser)
 
@@ -183,7 +288,7 @@ opt = parser.parse_args()
 
 def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
     use_complex_background=False, background_order=1, make_plots=False,
-    verbose=False, elliptical=None):
+    verbose=False, elliptical=None, curve_of_growth=False, fwhm=3):
 
     hdu = fits.open(file)
 
@@ -327,6 +432,10 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
         newhdu.writeto(file.replace('.fits','.sub.fits'), overwrite=True,
             output_verify='silentfix')
 
+    # do curve of growth correction
+    if curve_of_growth:
+        COG_corr = curve_of_growth_fnc(file, fwhm_init=fwhm)
+
     # Do photometry on the input data
     phot_table = aperture_photometry(use_data, aperture,
         wcs=WCS(hdu[use_idx].header), method='exact')
@@ -419,7 +528,7 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
         mag=np.NaN
         magerr=np.NaN
     else:
-        mag=mag+zpt ; magerr=np.sqrt(merr**2+zerr**2)
+        mag=mag+zpt ; magerr=np.sqrt(merr**2+zerr**2) # add COG_corr to mag here?
         mag=float(fmt%mag)
         magerr=float(fmt%magerr)
 
@@ -434,7 +543,7 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
 
 data = get_photometry(filename, coord, radius=opt.radius,
     use_idx=opt.idx, use_complex_background=opt.complex_background,
-    background_order=opt.order, make_plots=opt.plots, elliptical=opt.elliptical)
+    background_order=opt.order, make_plots=opt.plots, elliptical=opt.elliptical, curve_of_growth=opt.curve_of_growth)
 if opt.verbose:
     print('Got {0}+/-{1} at {2}, {3} for {4}'.format(data['mag'],data['magerr'],
         coord.ra.degree,coord.dec.degree,filename))
