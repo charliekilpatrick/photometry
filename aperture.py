@@ -95,7 +95,7 @@ def curve_of_growth_fnc(img_file, fwhm_init=5.0, threshold=3.5, diagnostic_plots
     # step 3: apply circular apertures to stars for a range of FWHM and do photometry
     step_size = 0.1
     radii = np.arange(0.25*fwhm, 4*fwhm, step_size)
-    x_data = np.arange(0, 4*fwhm, step_size)
+    #x_data = np.arange(0, 4*fwhm, step_size)
     apers_area = [np.pi*(step_size**2)]
 
     for r in radii:
@@ -108,12 +108,17 @@ def curve_of_growth_fnc(img_file, fwhm_init=5.0, threshold=3.5, diagnostic_plots
         apertures.append(CircularAnnulus(coords, r_in=r, r_out=r+step_size))  # Annuli apertures
 
     phot_table = aperture_photometry(img_hdu[0].data, apertures)
-
+    phot_table.remove_columns(['id', 'xcenter', 'ycenter']) # new table with only aperture sums
     ##############################################################
 
     # step 4: make curve_of_growth plot to check it worked
-    #if diagnostic_plots==True:
-    #    plt.scatter(apertures[0], phot_table['aperture_sum'][0]) # aperture sum vs aperture size <- not functional but this idea
+    if diagnostic_plots==True:
+        radii = np.append(radii, 4*fwhm) # add end point for same length as phot_table
+        phot_vals = np.lib.recfunctions.structured_to_unstructured(np.array(phot_table[1])) # unintuitive way to pull out data for a single star - change index to plot different
+        plt.scatter(radii, phot_vals) # phot measurement vs aperture size
+        plt.xlabel('Aperture radius [pix]')
+        plt.ylabel('Photometric measurement')
+        plt.show()
 
     ##############################################################
 
@@ -121,10 +126,13 @@ def curve_of_growth_fnc(img_file, fwhm_init=5.0, threshold=3.5, diagnostic_plots
     # COG_corr = flux @ r<FWHM / flux @ FWHM
 
     # step 6: convert to a magnitude
-    # flux to mag conversion here? or more complicated as COG corr isn't really a flux
+    # flux to mag conversion here?
     # COG_corr = X magnitudes
 
     return #COG_corr
+
+# call to test function
+#COG = curve_of_growth_fnc('../../z1_HST_Project/FRB20220610A_F160W_60mas_full_drz_sci.fits', fwhm_init=3.699)
 
 def complex_background(data, x0, y0, radius_inner=4, radius_outer=16, order=1,
     grow=4, test=False):
