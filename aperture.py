@@ -14,7 +14,9 @@ from astropy import units as u
 from astropy.wcs import WCS
 from astropy.io import fits
 from astropy.time import Time
+from astropy.stats import sigma_clipped_stats
 from scipy.optimize import curve_fit
+from scipy.stats import sigmaclip
 
 # photutils dependencies
 from photutils import SkyCircularAperture
@@ -22,8 +24,113 @@ from photutils import SkyEllipticalAperture
 from photutils import CircularAperture
 from photutils import CircularAnnulus
 from photutils import aperture_photometry
+from photutils.background import MADStdBackgroundRMS
+from photutils.detection import IRAFStarFinder
 
 import matplotlib.pyplot as plt
+
+def curve_of_growth_data(img_file, fwhm_init=5.0, threshold=50.0, 
+    diagnostic_plots=True, verbose=True):
+    '''
+    Function to calculate the curve-of-growth correction for performing aperture photometry
+    on objects smaller than the PSF of the image. Uses code from POTPyRI psf.py.
+
+    Inputs:
+            img_file [fits]: File to perform photometry on
+            fwhm_init [float]: full-width at half-maximum of stars
+            threshold [float]: minimum value for source selection
+            diagnostic_plots [boolean]: When True, returns plot of curve-of-growth
+    Outputs:
+            COG_corr []: Curve-of-growth aperture correction factor (in AB magnitudes)
+
+    '''
+    # step 1: identify stars
+    img_hdu = fits.open(img_file)
+    data = img_hdu[0].data
+
+    bkgrms = MADStdBackgroundRMS()
+    std = bkgrms(data)
+    iraffind = IRAFStarFinder(threshold=threshold*std**2, fwhm=fwhm_init)
+
+    stars = iraffind(data)
+    
+    mean, median, std_sky = sigma_clipped_stats(img_hdu[0].data, sigma=5.0)
+    img_data = img_hdu[0].data - median
+
+    ##############################################################
+
+    # step 2: ensure stars are point sources
+    mask = ((stars['xcentroid'] > 50) & (stars['xcentroid'] < (data.shape[1] -51))
+                & (stars['ycentroid'] > 50) & (stars['ycentroid'] < (data.shape[0] -51)))
+    stars = stars[mask]
+
+    stars = stars['xcentroid', 'ycentroid', 'fwhm', 'sharpness', 'roundness', 
+        'npix', 'pa', 'flux', 'sky']
+
+    # mask based on sharpness and roundness
+    mask = ((stars['sharpness'] < np.median(stars['sharpness'])+np.std(stars['sharpness'])) &\
+                (stars['roundness'] < np.median(stars['roundness'])+3*np.std(stars['roundness'])) &\
+                (stars['roundness'] > np.median(stars['roundness'])-3*np.std(stars['roundness'])))
+    fwhm_stars = stars[mask]
+
+    # mask based on FWHM
+    fwhm_clipped, _, _ = sigmaclip(fwhm_stars['fwhm'])
+    fwhm = np.median(fwhm_clipped)
+    std_fwhm = np.std(fwhm_clipped)
+    mask = (fwhm_stars['fwhm'] > fwhm-3*std_fwhm) &\
+        (fwhm_stars['fwhm'] < fwhm+3*std_fwhm)
+    fwhm_stars = fwhm_stars[mask]
+    fwhm = np.median(fwhm_stars['fwhm'])
+
+    ##############################################################
+    
+    # step 3: apply circular apertures to stars for a range of FWHM and do photometry
+    step_size = 0.1
+    radii = np.arange(0.10*fwhm, 8.00*fwhm, step_size)
+    
+    coords = [(fwhm_stars['xcentroid'][i],fwhm_stars['ycentroid'][i]) for i in range(len(fwhm_stars))]
+    
+    apertures=[]
+    for r in radii:
+        apertures.append(CircularAperture(coords, r=r))  # Annuli apertures
+
+    phot_table = aperture_photometry(img_data, apertures)
+    phot_table.remove_columns(['id', 'xcenter', 'ycenter']) # new table with only aperture sums
+    ##############################################################
+
+    fractions = []
+    for row in phot_table:
+        flux = [row[k] for k in phot_table.keys() if 'aperture_sum' in k]
+        flux = np.array(flux)
+        fraction = flux / np.max(flux)
+        fractions.append(fraction)
+
+    # step 4: make curve_of_growth plot to check it worked
+    if diagnostic_plots:
+        fig,ax = plt.subplots()
+        mean_fraction = []
+        fraction_err = []
+        for i in np.arange(len(radii)):
+            mean_fraction.append(np.mean([f[i] for f in fractions]))
+            fraction_err.append(np.std([f[i] for f in fractions]))
+
+        ax.errorbar(radii, mean_fraction, yerr=fraction_err) 
+        # phot measurement vs aperture size
+
+        plt.xlabel('Aperture radius [pix]')
+        plt.ylabel('Encircled energy fraction')
+        plt.show()
+
+    ##############################################################
+
+    # step 5: calculate curve_of_growth correction factor
+    # COG_corr = flux @ r<FWHM / flux @ FWHM
+
+    # step 6: convert to a magnitude
+    # flux to mag conversion here?
+    # COG_corr = X magnitudes
+
+    return(radii, mean_fraction, fraction_err)
 
 def complex_background(data, x0, y0, radius_inner=4, radius_outer=16, order=1,
     grow=4, test=False):
@@ -155,35 +262,16 @@ def add_options(parser=None, usage=None):
     parser.add_argument('--elliptical', nargs=3, type=float, default=None,
         help='semi-major axis (arcsec), semi-minor  (arcsec), and'+\
         ' position angle (in deg) from positive x axis.')
+    parser.add_argument('--curve_of_growth', default=False,
+        action='store_true', help='Perform curve-of-growth correction.')
+    parser.add_argument('--fwhm', default=3.0, type=float,
+        help='FWHM of the PSF in pixels.')
 
     return(parser)
 
-if len(sys.argv)<4:
-    print('Usage: aperture.py filename ra dec [options]')
-    sys.exit()
-
-filename = sys.argv[1]
-if not os.path.exists(filename):
-    print('ERROR: file {0} does not exist!'.format(filename))
-    print('Exiting...')
-    sys.exit()
-
-coord = parse_coord(sys.argv[2], sys.argv[3])
-if not coord:
-    print('ERROR: could not parse '+\
-        f'ra={sys.argv[2]}, dec={sys.argv[3]} into a coordinate')
-    print('Exiting...')
-    sys.exit()
-
-# This is to prevent argparse from choking if dec was not degrees as float
-sys.argv[2] = str(coord.ra.degree) ; sys.argv[3] = str(coord.dec.degree)
-
-parser = add_options()
-opt = parser.parse_args()
-
 def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
     use_complex_background=False, background_order=1, make_plots=False,
-    verbose=False, elliptical=None):
+    verbose=False, elliptical=None, curve_of_growth=False, fwhm=3):
 
     hdu = fits.open(file)
 
@@ -202,21 +290,15 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
         t = Time(h['DATE-OBS']+'T'+h['TIME-OBS'])
         mjd=float('%5.8f'%float(t.mjd))
     elif 'MJD-OBS' in h.keys():
-        print('MJD:','%5.8f'%float(h['MJD-OBS']))
         mjd=float('%5.8f'%float(h['MJD-OBS']))
     elif 'DATE_OBS' in h.keys():
         t = Time(h['DATE_OBS'])
         mjd=float('%5.8f'%float(t.mjd))
 
-    if 'CD1_1' in header.keys() and 'CD1_2' in header.keys():
-        pscale = np.sqrt(float(header['CD1_1'])**2+float(header['CD1_2'])**2)
-        pscale = np.abs(pscale * 3600.)
-    elif 'CDELT1' in header.keys():
-        pscale = np.abs(float(header['CDELT1']) * 3600.0)
-    else:
-        print('ERROR: could not parse WCS keywords for {0}'.format(file))
-        print('Exiting...')
-        sys.exit()
+    if verbose: print('MJD:','%5.8f'%float(h['MJD-OBS']))
+
+    pscale = np.mean(wcs.utils.proj_plane_pixel_scales(w)) * 3600.0
+    if verbose: print(f'pixel scale={pscale}')
 
     x,y = wcs.utils.skycoord_to_pixel(coord, w, origin=1, mode='wcs')
 
@@ -327,6 +409,10 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
         newhdu.writeto(file.replace('.fits','.sub.fits'), overwrite=True,
             output_verify='silentfix')
 
+    # do curve of growth correction
+    if curve_of_growth:
+        radii, fraction, fraction_err = curve_of_growth_data(file, fwhm_init=fwhm, verbose=verbose)
+
     # Do photometry on the input data
     phot_table = aperture_photometry(use_data, aperture,
         wcs=WCS(hdu[use_idx].header), method='exact')
@@ -337,8 +423,8 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
     # Now get background estimation
     # As default background aperture use an annulus with inner radius
     # and outer radius
-    if verbose:
-        print(f'r_in={2*radius/pscale}, r_out={4*radius/pscale}')
+    if verbose: print(f'r_in={2*radius/pscale}, r_out={4*radius/pscale}')
+
     background = CircularAnnulus((x,y), r_in = 2 * radius/pscale,
             r_out = 4 * radius/pscale)
     backmask = background.to_mask(method = 'center')
@@ -432,12 +518,39 @@ def get_photometry(file, coord, radius=3, significant_figures=4, use_idx=0,
     return(data)
 
 
-data = get_photometry(filename, coord, radius=opt.radius,
-    use_idx=opt.idx, use_complex_background=opt.complex_background,
-    background_order=opt.order, make_plots=opt.plots, elliptical=opt.elliptical)
-if opt.verbose:
-    print('Got {0}+/-{1} at {2}, {3} for {4}'.format(data['mag'],data['magerr'],
-        coord.ra.degree,coord.dec.degree,filename))
-mlimit=data['mlimit']
-if opt.verbose:
-    print(f'Limiting magnitude is {mlimit}')
+if __name__=='__main__':
+    if len(sys.argv)<4:
+        print('Usage: aperture.py filename ra dec [options]')
+        sys.exit()
+
+    filename = sys.argv[1]
+    if not os.path.exists(filename):
+        print('ERROR: file {0} does not exist!'.format(filename))
+        print('Exiting...')
+        sys.exit()
+
+    coord = parse_coord(sys.argv[2], sys.argv[3])
+    if not coord:
+        print('ERROR: could not parse '+\
+            f'ra={sys.argv[2]}, dec={sys.argv[3]} into a coordinate')
+        print('Exiting...')
+        sys.exit()
+
+    # This is to prevent argparse from choking if dec was not degrees as float
+    sys.argv[2] = str(coord.ra.degree) ; sys.argv[3] = str(coord.dec.degree)
+
+    parser = add_options()
+    opt = parser.parse_args()
+
+    data = get_photometry(filename, coord, radius=opt.radius,
+        use_idx=opt.idx, use_complex_background=opt.complex_background,
+        background_order=opt.order, make_plots=opt.plots, elliptical=opt.elliptical,
+        verbose=opt.verbose, curve_of_growth=opt.curve_of_growth)
+    if opt.verbose:
+        print('Got {0}+/-{1} at {2}, {3} for {4}'.format(data['mag'],data['magerr'],
+            coord.ra.degree,coord.dec.degree,filename))
+    mlimit=data['mlimit']
+    if opt.verbose:
+        print(f'Limiting magnitude is {mlimit}')
+    else:
+        print('{0} {1}'.format(data['mag'], data['magerr']))
